@@ -1,0 +1,7 @@
+"analysis";"tolerance_percent";"matrix_type";"isolates";"band_classes";"excluded_isolates";"mean_bands_per_isolate";"mean_dice";"median_dice";"min_dice";"max_dice";"identical_profiles"
+"all_1pct";1;"all";46;133;0;6,08695652173913;0,0445985789332564;0;0;1;1
+"calibrated_1pct";1;"calibrated";46;115;0;5,60869565217391;0,0466518704951424;0;0;1;2
+"all_2pct";2;"all";46;99;0;6,08695652173913;0,078585208504561;0;0;1;2
+"calibrated_2pct";2;"calibrated";46;83;0;5,60869565217391;0,0831448090056247;0;0;1;4
+"all_5pct";5;"all";46;56;0;6,08695652173913;0,197814520436209;0,166666666666667;0;1;7
+"calibrated_5pct";5;"calibrated";46;45;0;5,60869565217391;0,209419273287896;0,181818181818182;0;1;11
