@@ -4,15 +4,16 @@
 # Author: Gustavo Goncalves
 #
 # Description:
-# Complete pipeline: Image Lab Excel import, I7-REF alignment, band matching
-# (5% size tolerance), Dice similarity, and UPGMA clustering.
+# Integrated BOX-PCR analysis: Image Lab import, reference alignment,
+# 5% band matching, Dice / UPGMA, PCoA, group fingerprints, individual strips
+# and PGP selection. Selected-isolate figure assembly is handled separately.
 #
 # Input:  data/raw/Gel*-Analysis-Table.xlsx
 # Output: results/tables/ and results/figures/
 #
-# Lane layout (all gels):
-#   1 = ladder; 2 = I7-REF; 3-18 = experimental isolates; 19 = ladder
-#   GEL1 = I1-I16; GEL2 = I17-I32; ...; GEL6 = I81-I92
+# Lane layout:
+#   GEL1-GEL5: 1=M, 2=REF, 3:18=isolates, 19=M
+#   GEL6:      1=M, 2=REF, 3:14=I81-I92, 15=NTC, 16=M
 #   Experimental lanes without detected bands are omitted.
 #
 # Run from the RStudio project root: source("scripts/BOX-PCR_pipeline.R")
@@ -22,6 +23,22 @@
 library(readxl)
 library(dplyr)
 library(ggplot2)
+
+# Optional stages run when their input files are available.
+run_pcoa <- TRUE
+run_fingerprint_panels <- TRUE
+run_isolate_selection <- TRUE
+
+# Fixed clustering / selection parameters
+dissimilarity_cut <- 0.60  # 40% Dice similarity
+n_target <- 25L
+
+min_informative_bands <- 2L
+
+# Fingerprint panel geometry (original TIFF pixels)
+lane_width <- 28L
+crop_top <- 155L
+crop_bottom <- 560L
 
 # Paths: open BOX-PCR_R_Analysis.Rproj before running
 project_path <- getwd()
@@ -33,7 +50,6 @@ dir.create(figures_path, recursive = TRUE, showWarnings = FALSE)
 
 # Fixed parameters
 n_isolates_total <- 92L
-n_lanes <- 19L
 columns_per_lane <- 11L
 isolates_per_gel <- 16L
 tolerance <- 0.05
@@ -211,11 +227,13 @@ assignments <- bands_isolates %>%
   left_join(classes %>% select(cluster, band_class), by = "cluster") %>%
   select(-cluster)
 
+conflicts_path <- file.path(tables_path, "matching_conflicts.csv")
+if (file.exists(conflicts_path)) file.remove(conflicts_path)
 conflicts <- assignments %>%
   count(isolate, band_class, name = "n_bands") %>%
   filter(n_bands > 1L)
 if (nrow(conflicts) > 0L) {
-  write.csv2(conflicts, file.path(tables_path, "matching_conflicts.csv"),
+  write.csv2(conflicts, conflicts_path,
              row.names = FALSE)
   stop("Multiple bands from the same isolate were assigned to one class. ",
        "Review results/tables/matching_conflicts.csv before proceeding.")
@@ -307,26 +325,371 @@ p_heatmap <- ggplot(heatmap_data, aes(Isolate1, Isolate2, fill = Dice)) +
 ggsave(file.path(figures_path, "dice_heatmap_5pct.png"),
        plot = p_heatmap, width = 14, height = 12, dpi = 300)
 
-# Final summary
+
+# 6. PCoA of Dice dissimilarities -----------------------------------------------
+make_pcoa <- function(distance_matrix, hc, sample_metadata, figures_path) {
+  if (!all(hc$labels %in% sample_metadata$Isolate))
+    stop("PCoA: missing isolate metadata.")
+  ids <- hc$labels
+  sample_metadata <- sample_metadata[match(ids, sample_metadata$Isolate), , drop = FALSE]
+  for (variable in c("Morphotype", "BAG", "Species", "Accession")) {
+    if (anyNA(sample_metadata[[variable]]))
+      stop("PCoA: missing metadata for ", variable)
+    sample_metadata[[variable]] <- factor(sample_metadata[[variable]])
+  }
+  pcoa_dir <- file.path(figures_path, "pcoa")
+  dir.create(pcoa_dir, recursive = TRUE, showWarnings = FALSE)
+
+  ord <- cmdscale(as.dist(distance_matrix[ids, ids, drop = FALSE]),
+                  k = 2, eig = TRUE, add = TRUE)
+  if (is.null(dim(ord$points)) || ncol(ord$points) < 2L)
+    stop("PCoA requires two coordinates.")
+  positive <- ord$eig[ord$eig > 0]
+  axis_percent <- 100 * ord$eig[1:2] / sum(positive)
+  coords <- data.frame(Isolate = ids,
+                       PCoA1 = ord$points[, 1], PCoA2 = ord$points[, 2],
+                       sample_metadata[, c("Morphotype", "BAG", "Species", "Accession")],
+                       row.names = NULL)
+  write.csv2(coords, file.path(pcoa_dir, "pcoa_coordinates.csv"), row.names = FALSE)
+  xlab <- sprintf("PCoA1 (%.1f%%)", axis_percent[1])
+  ylab <- sprintf("PCoA2 (%.1f%%)", axis_percent[2])
+
+  for (variable in c("Species", "BAG", "Accession", "Morphotype")) {
+    p <- ggplot(coords, aes(x = PCoA1, y = PCoA2,
+                            color = .data[[variable]])) +
+      geom_point(size = 2.7, alpha = 0.85) +
+      labs(title = paste("BOX-PCR PCoA -", variable), x = xlab, y = ylab,
+           color = variable) + theme_bw()
+    ggsave(file.path(pcoa_dir, paste0("pcoa_", tolower(variable), ".png")),
+           p, width = 8, height = 6, dpi = 300)
+  }
+  combined <- ggplot(coords, aes(PCoA1, PCoA2, color = Accession, shape = BAG)) +
+    geom_point(size = 2.7, alpha = 0.85) +
+    labs(title = "BOX-PCR PCoA - Accession and BAG", x = xlab, y = ylab) +
+    theme_bw()
+  ggsave(file.path(pcoa_dir, "pcoa_accession_bag.png"),
+         combined, width = 8, height = 6, dpi = 300)
+  message("PCoA: 5 figures exported.")
+  invisible(coords)
+}
+
+# 7. Fingerprint panels using measured lane centers ----------------------------
+make_fingerprint_panels <- function(hc, isolate_metadata, project_path,
+                                    figures_path, dissimilarity_cut,
+                                    lane_width, crop_top, crop_bottom) {
+  if (!requireNamespace("magick", quietly = TRUE))
+    stop("Fingerprint panels require the 'magick' package.")
+  image_dir <- file.path(project_path, "data", "gel_images")
+  output_dir <- file.path(figures_path, "fingerprint_groups")
+  panels_dir <- file.path(output_dir, "aligned")
+  dir.create(panels_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Positions of the five REF bands in the original TIFF images.
+  settings <- data.frame(
+    gel = paste0("GEL", 1:6),
+    n_lanes = c(19L, 19L, 19L, 19L, 19L, 16L),
+    ref_1 = c(220, 203, 199, 207, 220, 205),
+    ref_2 = c(371, 349, 343, 360, 370, 350),
+    ref_3 = c(387, 365, 359, 375, 386, 366),
+    ref_4 = c(456, 435, 429, 445, 457, 437),
+    ref_5 = c(488, 469, 463, 478, 491, 472)
+  )
+  files <- setNames(file.path(image_dir, paste0(settings$gel, ".tif")), settings$gel)
+  if (any(!file.exists(files)))
+    stop("Missing TIFFs: ", paste(basename(files[!file.exists(files)]), collapse = ", "))
+  images <- lapply(files, magick::image_read)
+  centers <- read.csv2(file.path(image_dir, "lane_centers_measured.csv"),
+                       stringsAsFactors = FALSE)
+  stopifnot(all(c("gel", "lane", "center_x") %in% names(centers)),
+            !anyDuplicated(paste(centers$gel, centers$lane)))
+
+  m <- isolate_metadata[, c("gel", "lane", "isolate")]
+  stopifnot(setequal(m$isolate, hc$labels), !anyDuplicated(m$isolate))
+  m <- m[match(hc$labels, m$isolate), , drop = FALSE]
+  m$lane <- as.integer(m$lane)
+  m$group <- as.integer(cutree(hc, h = dissimilarity_cut)[m$isolate])
+  leaf_order <- hc$labels[hc$order]
+  m <- m[order(m$group, match(m$isolate, leaf_order)), , drop = FALSE]
+
+  geometry <- setNames(lapply(seq_len(nrow(settings)), function(i) {
+    s <- settings[i, ]; gel <- s$gel
+    info <- magick::image_info(images[[gel]])
+    if (info$width != 1726L || info$height != 832L)
+      stop(gel, ": unexpected TIFF dimensions (expected 1726 x 832).")
+    calibrated <- centers[centers$gel == gel, ]
+    calibrated <- calibrated[match(seq_len(s$n_lanes), calibrated$lane), ]
+    if (anyNA(calibrated$center_x) || anyNA(calibrated$lane))
+      stop(gel, ": incomplete measured centers.")
+    left <- as.integer(round(as.numeric(calibrated$center_x) - lane_width / 2))
+    if (any(left < 0 | left + lane_width > info$width))
+      stop(gel, ": crop outside image.")
+    ref <- as.numeric(unlist(s[paste0("ref_", 1:5)], use.names = FALSE))
+    if (any(diff(ref) <= 0) || min(ref) <= crop_top || max(ref) >= crop_bottom)
+      stop(gel, ": invalid REF coordinates.")
+    list(left = left, ref = ref)
+  }), settings$gel)
+
+  for (i in seq_len(nrow(m))) {
+    lanes <- if (m$gel[i] == "GEL6") 3:14 else 3:18
+    if (!(m$gel[i] %in% names(geometry)) || !(m$lane[i] %in% lanes))
+      stop("Invalid gel/lane for ", m$isolate[i])
+  }
+  ref_targets <- apply(do.call(rbind, lapply(geometry, `[[`, "ref")), 2, median)
+  header <- 32L; footer <- 25L; padding <- 7L; gutter <- 9L
+  strip_width <- lane_width + 2L * padding
+  strip_height <- header + (crop_bottom - crop_top) + footer
+
+  align_lane <- function(img, ref) {
+    src <- as.integer(c(crop_top, ref, crop_bottom))
+    dst <- as.integer(round(c(crop_top, ref_targets, crop_bottom)))
+    parts <- lapply(seq_len(length(src) - 1L), function(j) {
+      section <- magick::image_crop(img, magick::geometry_area(
+        lane_width, src[j + 1L] - src[j], 0L, src[j] - crop_top))
+      magick::image_resize(section,
+                           sprintf("%dx%d!", lane_width, dst[j + 1L] - dst[j]),
+                           filter = "Triangle")
+    })
+    magick::image_append(magick::image_join(parts), stack = TRUE)
+  }
+  make_strip <- function(gel, lane, label) {
+    piece <- magick::image_crop(images[[gel]], magick::geometry_area(
+      lane_width, crop_bottom - crop_top, geometry[[gel]]$left[lane], crop_top))
+    piece <- align_lane(piece, geometry[[gel]]$ref)
+    canvas <- magick::image_blank(strip_width, strip_height, color = "white")
+    canvas <- magick::image_composite(canvas, piece,
+                                    offset = sprintf("+%d+%d", padding, header))
+    canvas <- magick::image_annotate(canvas, label, size = 12, color = "black",
+                                     gravity = "north", location = "+0+7")
+    magick::image_annotate(canvas, gel, size = 10, color = "gray40",
+                           gravity = "south", location = "+0+4")
+  }
+  assemble <- function(strips) {
+    gap <- magick::image_blank(gutter, strip_height, color = "white")
+    parts <- list()
+    for (i in seq_along(strips)) {
+      if (i > 1L) parts[[length(parts) + 1L]] <- gap
+      parts[[length(parts) + 1L]] <- strips[[i]]
+    }
+    magick::image_append(magick::image_join(parts), stack = FALSE)
+  }
+  for (group in sort(unique(m$group))) {
+    sub <- m[m$group == group, , drop = FALSE]
+    strips <- lapply(seq_len(nrow(sub)), function(i)
+      make_strip(sub$gel[i], sub$lane[i], sub$isolate[i]))
+    magick::image_write(assemble(strips),
+                        file.path(panels_dir, sprintf("group_%02d.png", group)),
+                        format = "png")
+  }
+  write.csv2(m[, c("group", "isolate", "gel", "lane")],
+             file.path(output_dir, "group_membership.csv"), row.names = FALSE)
+
+  # Individual aligned strips for reproducible figure assembly.
+  strips_dir <- file.path(output_dir, "strips_aligned")
+  dir.create(strips_dir, recursive = TRUE, showWarnings = FALSE)
+  for (i in seq_len(nrow(m))) {
+    magick::image_write(
+      make_strip(m$gel[i], m$lane[i], m$isolate[i]),
+      file.path(strips_dir, paste0(m$isolate[i], ".png")), format = "png")
+  }
+
+  message("Individual aligned strips: ", nrow(m), " exported to ", strips_dir)
+
+  ref_strips <- lapply(names(geometry), function(g) make_strip(g, 2L, g))
+  magick::image_write(assemble(ref_strips),
+                      file.path(output_dir, "REF_QC_aligned.png"), format = "png")
+  message("Fingerprint panels: ", length(unique(m$group)), " groups exported.")
+  invisible(m)
+}
+
+# 8. Group summary and preliminary selection for PGP ----------------------------
+make_isolate_selection <- function(hc, similarity, binary, sample_metadata,
+                                   output_path, dissimilarity_cut, n_target,
+                                   min_informative_bands) {
+  dir.create(output_path, recursive = TRUE, showWarnings = FALSE)
+  ids <- hc$labels
+  dice <- similarity[ids, ids, drop = FALSE]
+  binary <- binary[ids, , drop = FALSE]
+  sample_metadata <- sample_metadata[match(ids, sample_metadata$Isolate), , drop = FALSE]
+  if (anyNA(sample_metadata)) stop("Missing isolate metadata for selection.")
+  variables <- c("BAG", "Species", "Accession", "Morphotype")
+  for (v in variables) sample_metadata[[v]] <- as.character(sample_metadata[[v]])
+
+  cluster <- as.integer(cutree(hc, h = dissimilarity_cut)[ids])
+  members <- data.frame(Isolate = ids, Group = cluster,
+                        n_bands = rowSums(binary),
+                        sample_metadata[, variables], row.names = NULL)
+  members <- members[order(members$Group,
+                           as.integer(sub("^I", "", members$Isolate))), ]
+  groups <- sort(unique(members$Group))
+
+  choose_representative <- function(group_ids) {
+    candidates <- group_ids
+    valid <- group_ids[rowSums(binary[group_ids, , drop = FALSE]) >=
+                         min_informative_bands]
+    if (length(valid)) candidates <- valid
+    mean_sim <- vapply(candidates, function(x) mean(dice[x, group_ids]), numeric(1))
+    band_n <- rowSums(binary[candidates, , drop = FALSE])
+    num <- as.integer(sub("^I", "", candidates))
+    candidates[order(-mean_sim, -band_n, num)][1]
+  }
+  summary_rows <- lapply(groups, function(g) {
+    sub <- members[members$Group == g, ]
+    group_ids <- sub$Isolate
+    rep_id <- choose_representative(group_ids)
+    rep_row <- members[match(rep_id, members$Isolate), ]
+    within <- if (length(group_ids) > 1L) {
+      z <- dice[group_ids, group_ids, drop = FALSE]
+      z[upper.tri(z)]
+    } else NA_real_
+    data.frame(Group = g, n_isolates = length(group_ids),
+               Members = paste(group_ids, collapse = ", "),
+               Representative = rep_id, Rep_n_bands = rep_row$n_bands,
+               Mean_within_group_Dice = mean(within),
+               Rep_mean_group_Dice = mean(dice[rep_id, group_ids]),
+               Low_resolution_group = all(sub$n_bands < min_informative_bands),
+               BAG = rep_row$BAG, Species = rep_row$Species,
+               Accession = rep_row$Accession, Morphotype = rep_row$Morphotype)
+  })
+  summary <- do.call(rbind, summary_rows)
+  rownames(summary) <- NULL
+
+  selected <- summary$Representative
+  coverage <- function(reps) {
+    mean(apply(dice[ids, reps, drop = FALSE], 1, max))
+  }
+  keeps_categories <- function(reps) {
+    chosen <- sample_metadata[match(reps, sample_metadata$Isolate), , drop = FALSE]
+    all(vapply(variables, function(v)
+      all(unique(sample_metadata[[v]]) %in% unique(chosen[[v]])), logical(1)))
+  }
+  if (n_target < 1L) stop("n_target must be >= 1.")
+  if (n_target > length(selected))
+    warning("n_target exceeds groups: retaining one representative per group.")
+  if (!keeps_categories(selected))
+    warning("Initial representatives do not cover every metadata category. Review group_summary.csv.")
+  while (length(selected) > n_target) {
+    options <- selected[vapply(selected, function(r)
+      keeps_categories(setdiff(selected, r)), logical(1))]
+    if (!length(options)) {
+      warning("Cannot reach target without losing a metadata category.")
+      break
+    }
+    scores <- vapply(options, function(r) coverage(setdiff(selected, r)), numeric(1))
+    rows <- summary[match(options, summary$Representative), ]
+    ord <- order(-scores, rows$Rep_n_bands, rows$n_isolates, rows$Group)
+    selected <- setdiff(selected, options[ord[1]])
+  }
+  summary$Selection <- ifelse(summary$Representative %in% selected,
+                              "Selected (provisional)", "Reserve")
+  summary$Nearest_selected <- vapply(summary$Representative, function(rep_id) {
+    selected[which.max(dice[rep_id, selected])]
+  }, character(1))
+  summary$Dice_to_nearest_selected <- vapply(seq_len(nrow(summary)), function(i)
+    dice[summary$Representative[i], summary$Nearest_selected[i]], numeric(1))
+  summary$Review <- ifelse(summary$Low_resolution_group,
+                           "Low resolution: all fingerprints have 1 band",
+                           ifelse(summary$Rep_n_bands <= 2,
+                                  "Review limited number of bands", ""))
+  members$Selection <- summary$Selection[match(members$Group, summary$Group)]
+  members$Representative <- summary$Representative[match(members$Group, summary$Group)]
+  members$Role <- ifelse(members$Isolate == members$Representative,
+                         "Representative", "Other member")
+  write.csv2(members, file.path(output_path, "group_membership.csv"), row.names = FALSE)
+  write.csv2(summary, file.path(output_path, "group_summary.csv"), row.names = FALSE)
+  write.csv2(summary[summary$Selection == "Selected (provisional)", ],
+             file.path(output_path, sprintf("selected_%02d_provisional.csv", n_target)), row.names = FALSE)
+  write.csv2(summary[summary$Selection == "Reserve", ],
+             file.path(output_path, "reserve_groups.csv"), row.names = FALSE)
+
+  members$Group_label <- factor(paste0("G", members$Group),
+                                levels = paste0("G", groups))
+  members$Position <- ave(seq_len(nrow(members)), members$Group, FUN = seq_along)
+  max_members <- max(summary$n_isolates)
+  p <- ggplot(members, aes(x = Group_label, y = Position - 0.5)) +
+    geom_tile(aes(fill = Selection), width = 0.88, height = 0.91,
+              color = "white", size = 0.25) +
+    geom_text(aes(label = Isolate), size = 2.4) +
+    scale_fill_manual(values = c("Selected (provisional)" = "#86B5A7",
+                                 "Reserve" = "#D9DDE3"), drop = FALSE) +
+    scale_y_continuous(breaks = seq(0, max_members, 1),
+                       limits = c(0, max_members + 0.6), expand = c(0, 0)) +
+    labs(title = "BOX-PCR - UPGMA group composition",
+         subtitle = sprintf("Dice dissimilarity: %.2f | %d groups | %d proposed representatives",
+                            dissimilarity_cut, length(groups), length(selected)),
+         x = "UPGMA group", y = "Number of isolates", fill = "PGP selection") +
+    theme_bw() +
+    theme(panel.grid.major.x = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.text.x = element_text(angle = 90, hjust = 1, size = 8),
+          legend.position = "bottom")
+  fig_width <- max(15, 0.45 * length(groups))
+  ggsave(file.path(output_path, "group_composition_labeled.png"), p,
+         width = fig_width, height = 8.5, dpi = 300, limitsize = FALSE)
+  ggsave(file.path(output_path, "group_composition_labeled.pdf"), p,
+         width = fig_width, height = 8.5, limitsize = FALSE)
+  message("Selection: ", length(groups), " groups; ", length(selected),
+          " provisional representatives.")
+  invisible(summary)
+}
+
+# 9. Optional analyses -----------------------------------------------------------
+metadata_file <- file.path(project_path, "data", "metadata", "metadata-box.xlsx")
+image_dir <- file.path(project_path, "data", "gel_images")
+center_file <- file.path(image_dir, "lane_centers_measured.csv")
+
+sample_metadata <- NULL
+if (run_pcoa || run_isolate_selection) {
+  if (file.exists(metadata_file)) {
+    sample_metadata <- as.data.frame(readxl::read_excel(metadata_file))
+    needed <- c("Isolate", "Morphotype", "BAG", "Species", "Accession")
+    if (!all(needed %in% names(sample_metadata)))
+      stop("Metadata missing columns: ", paste(setdiff(needed, names(sample_metadata)), collapse = ", "))
+    if (anyDuplicated(sample_metadata$Isolate)) stop("Duplicated Isolate in metadata.")
+    if (!all(hc$labels %in% sample_metadata$Isolate))
+      stop("Missing metadata for: ", paste(setdiff(hc$labels, sample_metadata$Isolate), collapse = ", "))
+    sample_metadata <- sample_metadata[match(hc$labels, sample_metadata$Isolate), ]
+  } else {
+    warning("No data/metadata/isolate_metadata.xlsx: skipping PCoA and isolate selection.")
+  }
+}
+
+if (run_pcoa && !is.null(sample_metadata))
+  make_pcoa(dissimilarity, hc, sample_metadata, figures_path)
+
+if (run_fingerprint_panels) {
+  tif_files <- file.path(image_dir, paste0("GEL", 1:6, ".tif"))
+  if (length(files) == 6L && all(file.exists(tif_files)) && file.exists(center_file)) {
+    make_fingerprint_panels(hc, metadata, project_path, figures_path,
+                            dissimilarity_cut, lane_width, crop_top, crop_bottom)
+  } else {
+    warning("Missing TIFFs / lane_centers_measured.csv (or fewer than 6 gels): skipping panels.")
+  }
+}
+
+if (run_isolate_selection && !is.null(sample_metadata))
+  make_isolate_selection(hc, similarity, binary, sample_metadata,
+                         file.path(project_path, "results", "isolate_selection"),
+                         dissimilarity_cut, n_target, min_informative_bands)
+
+# 10. Final summary -------------------------------------------------------------
 pairwise <- similarity[upper.tri(similarity)]
-cat("\nBOX-PCR COMPLETE PIPELINE\n")
-cat("-----------------------------\n")
+cat("\nBOX-PCR INTEGRATED PIPELINE\n")
+cat("--------------------------------------\n")
 cat("Gels:", length(files), "\n")
 cat("Isolates retained:", nrow(binary), "\n")
 cat("Detected experimental bands:", nrow(bands_isolates), "\n")
 cat("Band classes (5%):", ncol(binary), "\n")
 cat("Mean Dice similarity:", round(mean(pairwise), 4), "\n")
-cat("Identical binary-profile pairs:", sum(pairwise == 1), "\n")
-cat("Output tables:", tables_path, "\n")
-cat("Output figures:", figures_path, "\n")
+cat("Groups at Dice dissimilarity", dissimilarity_cut, ":",
+    length(unique(cutree(hc, h = dissimilarity_cut))), "\n")
+cat("Results:", file.path(project_path, "results"), "\n")
 
-# Similarity thresholds
-similarities <- seq(0.50, 1.00, by = 0.05)
-
-# Count groups at each threshold
-data.frame(
-  Similarity = similarities,
-  Groups = sapply(similarities, function(s) {
-    length(unique(cutree(hc, h = 1 - s)))
-  })
+similarity_thresholds <- seq(0.50, 1.00, by = 0.05)
+threshold_summary <- data.frame(
+  Similarity = similarity_thresholds,
+  Groups = vapply(similarity_thresholds,
+                  function(s) length(unique(cutree(hc, h = 1 - s))), integer(1))
 )
+write.csv2(threshold_summary, file.path(tables_path, "group_counts_by_similarity.csv"),
+           row.names = FALSE)
+print(threshold_summary, row.names = FALSE)

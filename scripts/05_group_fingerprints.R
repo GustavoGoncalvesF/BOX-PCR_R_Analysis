@@ -13,6 +13,9 @@ tables_dir <- file.path(project_path, "results", "tables")
 output_dir <- file.path(project_path, "results", "figures", "fingerprint_groups")
 panels_dir <- file.path(output_dir, "aligned")
 dir.create(panels_dir, recursive = TRUE, showWarnings = FALSE)
+strips_dir <- file.path(project_path, "results", "figures",
+                        "fingerprint_groups", "strips_aligned")
+dir.create(strips_dir, recursive = TRUE, showWarnings = FALSE)
 
 threshold_dissimilarity <- 0.50
 lane_width <- 33L
@@ -139,10 +142,40 @@ for (group in sort(unique(meta$group))) {
 }
 
 # Outputs -------------------------------------------------------------------------
-write.csv2(meta[, c("group", "isolate", "gel", "lane")],
-           file.path(output_dir, "group_membership.csv"), row.names = FALSE)
 
-ref_strips <- lapply(names(geometry), function(g) make_strip(g, 2L, g))
-image_write(assemble(ref_strips), file.path(output_dir, "REF_QC_aligned.png"))
+# Export group membership
+write.csv2(
+  meta[, c("group", "isolate", "gel", "lane")],
+  file.path(output_dir, "group_membership.csv"),
+  row.names = FALSE
+)
+
+# Export individual aligned fingerprint strips
+for (i in seq_len(nrow(meta))) {
+
+  strip <- make_strip(
+    meta$gel[i],
+    as.integer(meta$lane[i]),
+    meta$isolate[i]
+  )
+
+  image_write(
+    strip,
+    file.path(strips_dir, paste0(meta$isolate[i], ".png")),
+    format = "png"
+  )
+}
+
+# Export reference alignment QC
+ref_strips <- lapply(
+  names(geometry),
+  function(g) make_strip(g, 2L, g)
+)
+
+image_write(
+  assemble(ref_strips),
+  file.path(output_dir, "REF_QC_aligned.png"),
+  format = "png"
+)
 
 message("Exported ", length(unique(meta$group)), " aligned fingerprint groups to: ", panels_dir)
