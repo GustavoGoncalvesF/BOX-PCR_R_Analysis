@@ -70,9 +70,15 @@ import_gel <- function(file, gel_no) {
   gel <- paste0("GEL", gel_no)
   raw <- read_excel(file, skip = 2, col_names = FALSE,
                     .name_repair = "minimal")
-  if (ncol(raw) != n_lanes * columns_per_lane) {
-    stop(gel, ": expected ", n_lanes * columns_per_lane,
-         " columns but found ", ncol(raw), ".")
+  # Expected number of lanes
+  expected_lanes <- if (gel_no == 6L) 16L else 19L
+
+  # Validate Image Lab export
+  if (ncol(raw) != expected_lanes * columns_per_lane) {
+    stop(
+      gel, ": expected ", expected_lanes * columns_per_lane,
+      " columns but found ", ncol(raw), "."
+    )
   }
 
   first_id <- (gel_no - 1L) * isolates_per_gel + 1L
@@ -313,3 +319,14 @@ cat("Mean Dice similarity:", round(mean(pairwise), 4), "\n")
 cat("Identical binary-profile pairs:", sum(pairwise == 1), "\n")
 cat("Output tables:", tables_path, "\n")
 cat("Output figures:", figures_path, "\n")
+
+# Similarity thresholds
+similarities <- seq(0.50, 1.00, by = 0.05)
+
+# Count groups at each threshold
+data.frame(
+  Similarity = similarities,
+  Groups = sapply(similarities, function(s) {
+    length(unique(cutree(hc, h = 1 - s)))
+  })
+)
