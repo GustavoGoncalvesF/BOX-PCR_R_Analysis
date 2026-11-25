@@ -1,4 +1,17 @@
-.Rproj.user
+# RStudio
 .Rhistory
 .RData
 .Ruserdata
+.Rproj.user/
+
+# Generated results
+/results/
+
+# Experimental data
+/data/raw/
+/data/gel_images/
+
+# Temporary files
+*.tmp
+*.bak
+~$*
